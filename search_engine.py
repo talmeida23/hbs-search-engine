@@ -427,3 +427,182 @@ class HybridSearchEngine(SearchEngine):
         for rank, (idx, _) in enumerate(results_b, start=1):
             fused[idx] = fused.get(idx, 0.0) + 1.0 / (k + rank)
         return fused
+
+
+# ====================================================================== #
+# Phase C: Re-ranking engines                                            #
+# ====================================================================== #
+
+
+class ReRankingEngine(SearchEngine):
+    """Two-stage retrieve-then-rerank engine.
+
+    A first-stage *retriever* fetches ``retrieve_n`` candidates, then a
+    *reranker* callable rescores them and the top ``top_n`` are returned.
+
+    Parameters
+    ----------
+    retriever : SearchEngine
+        Fitted first-stage engine.
+    reranker : callable
+        ``reranker(query, candidates, product_df) -> list[tuple[int, float]]``
+        where *candidates* is ``list[tuple[int, float]]`` from the retriever.
+    retrieve_n : int
+        Number of candidates passed to the reranker.
+    name_override : str | None
+        Custom display name.
+    """
+
+    def __init__(
+        self,
+        retriever: SearchEngine,
+        reranker: Callable,
+        retrieve_n: int = 100,
+        name_override: str | None = None,
+    ):
+        self.retriever = retriever
+        self.reranker = reranker
+        self.retrieve_n = retrieve_n
+        self._name_override = name_override
+        self._product_df: pd.DataFrame | None = None
+
+    @property
+    def name(self) -> str:
+        if self._name_override:
+            return self._name_override
+        return f"ReRank({self.retriever.name})"
+
+    def fit(self, product_df: pd.DataFrame) -> None:
+        self._product_df = product_df
+        logger.info("%s — ready (retriever already fitted)", self.name)
+
+    def search_with_scores(
+        self, query: str, top_n: int = 10
+    ) -> list[tuple[int, float]]:
+        t0 = time.perf_counter()
+        candidates = self.retriever.search_with_scores(query, self.retrieve_n)
+        reranked = self.reranker(query, candidates, self._product_df)
+        result = reranked[:top_n]
+        elapsed = time.perf_counter() - t0
+        logger.debug("%s — query '%s' in %.4fs", self.name, query, elapsed)
+        return result
+
+
+class CrossEncoderReranker:
+    """Reranker using a cross-encoder model from sentence-transformers.
+
+    Scores each ``(query, document_text)`` pair and re-sorts by
+    cross-encoder score.  Intended for use with :class:`ReRankingEngine`.
+
+    Parameters
+    ----------
+    model_name : str
+        HuggingFace model ID, e.g. ``"cross-encoder/ms-marco-MiniLM-L-6-v2"``.
+    columns : list[str]
+        Product columns to concatenate as the document text.
+    """
+
+    def __init__(
+        self,
+        model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        columns: list[str] | None = None,
+    ):
+        self.model_name = model_name
+        self.columns = columns or ["product_name", "product_description"]
+        self._model = None
+
+    def _ensure_model(self):
+        if self._model is None:
+            from sentence_transformers import CrossEncoder
+
+            self._model = CrossEncoder(self.model_name)
+            logger.info("CrossEncoderReranker — loaded %s", self.model_name)
+
+    def __call__(
+        self,
+        query: str,
+        candidates: list[tuple[int, float]],
+        product_df: pd.DataFrame,
+    ) -> list[tuple[int, float]]:
+        self._ensure_model()
+        pairs = []
+        idxs = []
+        for idx, _ in candidates:
+            doc = " ".join(
+                str(product_df.at[idx, c]) for c in self.columns if c in product_df.columns
+            )
+            pairs.append((query, doc))
+            idxs.append(idx)
+        scores = self._model.predict(pairs)
+        scored = list(zip(idxs, scores.tolist()))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored
+
+
+class MetadataBoostReranker:
+    """Reranker that boosts retrieval scores with product metadata.
+
+    ``final = retrieval_score_norm + beta * rating_norm + gamma * popularity_norm``
+
+    where ``popularity_norm`` is log-scaled review_count.
+
+    Parameters
+    ----------
+    beta : float
+        Weight for normalised average_rating.
+    gamma : float
+        Weight for normalised log(review_count + 1).
+    rating_col : str
+        Column name for average rating.
+    review_col : str
+        Column name for review count.
+    """
+
+    def __init__(
+        self,
+        beta: float = 0.1,
+        gamma: float = 0.05,
+        rating_col: str = "average_rating",
+        review_col: str = "review_count",
+    ):
+        self.beta = beta
+        self.gamma = gamma
+        self.rating_col = rating_col
+        self.review_col = review_col
+
+    def __call__(
+        self,
+        query: str,
+        candidates: list[tuple[int, float]],
+        product_df: pd.DataFrame,
+    ) -> list[tuple[int, float]]:
+        if not candidates:
+            return candidates
+
+        # Min-max normalise retrieval scores
+        scores = {idx: s for idx, s in candidates}
+        lo, hi = min(scores.values()), max(scores.values())
+        rng = hi - lo if hi != lo else 1.0
+        norm_scores = {idx: (s - lo) / rng for idx, s in scores.items()}
+
+        # Pre-compute rating/popularity normalisation bounds from candidates
+        ratings = []
+        popularities = []
+        for idx, _ in candidates:
+            ratings.append(float(product_df.at[idx, self.rating_col] or 0))
+            popularities.append(np.log1p(float(product_df.at[idx, self.review_col] or 0)))
+
+        r_lo, r_hi = min(ratings), max(ratings)
+        r_rng = r_hi - r_lo if r_hi != r_lo else 1.0
+        p_lo, p_hi = min(popularities), max(popularities)
+        p_rng = p_hi - p_lo if p_hi != p_lo else 1.0
+
+        boosted = []
+        for i, (idx, _) in enumerate(candidates):
+            r_norm = (ratings[i] - r_lo) / r_rng
+            p_norm = (popularities[i] - p_lo) / p_rng
+            final = norm_scores[idx] + self.beta * r_norm + self.gamma * p_norm
+            boosted.append((idx, final))
+
+        boosted.sort(key=lambda x: x[1], reverse=True)
+        return boosted
