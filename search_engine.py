@@ -307,3 +307,123 @@ class WeightedTfidfSearchEngine(SearchEngine):
         elapsed = time.perf_counter() - t0
         logger.debug("%s — query '%s' in %.4fs", self.name, query, elapsed)
         return result
+
+
+class HybridSearchEngine(SearchEngine):
+    """Score-fusion hybrid that blends two engines.
+
+    Supports two fusion strategies:
+
+    * **weighted** (default): min-max normalises each engine's scores and
+      computes ``alpha * scores_a + (1 - alpha) * scores_b``.
+    * **rrf** (Reciprocal Rank Fusion): parameter-free fusion using
+      ``1 / (k + rank)`` for each engine, then summed.
+
+    Both engines must already be fitted before calling :meth:`fit` on
+    the hybrid (which is a no-op).
+
+    Parameters
+    ----------
+    engine_a, engine_b : SearchEngine
+        Two fitted engines to fuse.
+    alpha : float
+        Blending weight for *engine_a* when ``strategy="weighted"``.
+        Ignored when ``strategy="rrf"``.
+    strategy : str
+        ``"weighted"`` or ``"rrf"``.
+    retrieve_n : int
+        How many candidates to pull from each engine before fusion.
+    name_override : str | None
+        Custom display name.
+    """
+
+    def __init__(
+        self,
+        engine_a: SearchEngine,
+        engine_b: SearchEngine,
+        alpha: float = 0.5,
+        strategy: str = "weighted",
+        retrieve_n: int = 100,
+        name_override: str | None = None,
+    ):
+        self.engine_a = engine_a
+        self.engine_b = engine_b
+        self.alpha = alpha
+        self.strategy = strategy
+        self.retrieve_n = retrieve_n
+        self._name_override = name_override
+
+    @property
+    def name(self) -> str:
+        if self._name_override:
+            return self._name_override
+        return (
+            f"Hybrid({self.engine_a.name} + {self.engine_b.name}, "
+            f"α={self.alpha}, {self.strategy})"
+        )
+
+    def fit(self, product_df: pd.DataFrame) -> None:
+        # Both sub-engines should already be fitted.
+        logger.info("%s — using pre-fitted sub-engines", self.name)
+
+    def search_with_scores(
+        self, query: str, top_n: int = 10
+    ) -> list[tuple[int, float]]:
+        t0 = time.perf_counter()
+
+        results_a = self.engine_a.search_with_scores(query, self.retrieve_n)
+        results_b = self.engine_b.search_with_scores(query, self.retrieve_n)
+
+        if self.strategy == "rrf":
+            fused = self._rrf(results_a, results_b)
+        else:
+            fused = self._weighted(results_a, results_b, self.alpha)
+
+        # Sort descending by fused score, take top_n
+        ranked = sorted(fused.items(), key=lambda x: x[1], reverse=True)[:top_n]
+        result = [(idx, score) for idx, score in ranked]
+        elapsed = time.perf_counter() - t0
+        logger.debug("%s — query '%s' in %.4fs", self.name, query, elapsed)
+        return result
+
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _minmax(scores: dict[int, float]) -> dict[int, float]:
+        if not scores:
+            return scores
+        lo = min(scores.values())
+        hi = max(scores.values())
+        rng = hi - lo
+        if rng == 0:
+            return {k: 0.0 for k in scores}
+        return {k: (v - lo) / rng for k, v in scores.items()}
+
+    @classmethod
+    def _weighted(
+        cls,
+        results_a: list[tuple[int, float]],
+        results_b: list[tuple[int, float]],
+        alpha: float,
+    ) -> dict[int, float]:
+        scores_a = cls._minmax(dict(results_a))
+        scores_b = cls._minmax(dict(results_b))
+        all_ids = set(scores_a) | set(scores_b)
+        return {
+            idx: alpha * scores_a.get(idx, 0.0)
+            + (1 - alpha) * scores_b.get(idx, 0.0)
+            for idx in all_ids
+        }
+
+    @staticmethod
+    def _rrf(
+        results_a: list[tuple[int, float]],
+        results_b: list[tuple[int, float]],
+        k: int = 60,
+    ) -> dict[int, float]:
+        fused: dict[int, float] = {}
+        for rank, (idx, _) in enumerate(results_a, start=1):
+            fused[idx] = fused.get(idx, 0.0) + 1.0 / (k + rank)
+        for rank, (idx, _) in enumerate(results_b, start=1):
+            fused[idx] = fused.get(idx, 0.0) + 1.0 / (k + rank)
+        return fused
