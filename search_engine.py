@@ -16,8 +16,8 @@ class SearchEngine(ABC):
     """Abstract base class for all search engine implementations.
 
     Subclasses must implement ``fit`` to build an index from a product
-    DataFrame and ``search`` to retrieve the top-N product *indices*
-    for a given query string.
+    DataFrame and ``search_with_scores`` to retrieve the top-N product
+    *indices* with their scores for a given query string.
     """
 
     @property
@@ -30,8 +30,14 @@ class SearchEngine(ABC):
         """Build the search index from a product DataFrame."""
 
     @abstractmethod
+    def search_with_scores(
+        self, query: str, top_n: int = 10
+    ) -> list[tuple[int, float]]:
+        """Return the top-N (index, score) pairs for *query*."""
+
     def search(self, query: str, top_n: int = 10) -> list[int]:
         """Return the top-N product indices for *query*."""
+        return [idx for idx, _ in self.search_with_scores(query, top_n)]
 
     # ---- helpers shared by all engines ----
 
@@ -60,18 +66,24 @@ class TfidfSearchEngine(SearchEngine):
         self,
         columns: list[str] | None = None,
         vectorizer_kwargs: dict[str, Any] | None = None,
+        preprocessor: Callable[[str], str] | None = None,
+        name_override: str | None = None,
     ):
         self.columns = columns or ["product_name", "product_description"]
         self.vectorizer_kwargs = vectorizer_kwargs or {}
+        self.preprocessor = preprocessor
+        self._name_override = name_override
         self._vectorizer: TfidfVectorizer | None = None
         self._tfidf_matrix = None
 
     @property
     def name(self) -> str:
-        return f"TF-IDF ({', '.join(self.columns)})"
+        return self._name_override or f"TF-IDF ({', '.join(self.columns)})"
 
     def fit(self, product_df: pd.DataFrame) -> None:
         combined = self._combine_columns(product_df, self.columns)
+        if self.preprocessor:
+            combined = combined.map(self.preprocessor)
         self._vectorizer = TfidfVectorizer(**self.vectorizer_kwargs)
         self._tfidf_matrix = self._vectorizer.fit_transform(combined)
         logger.info(
@@ -81,17 +93,21 @@ class TfidfSearchEngine(SearchEngine):
             len(self._vectorizer.vocabulary_),
         )
 
-    def search(self, query: str, top_n: int = 10) -> list[int]:
+    def search_with_scores(
+        self, query: str, top_n: int = 10
+    ) -> list[tuple[int, float]]:
         if self._vectorizer is None or self._tfidf_matrix is None:
             raise RuntimeError("Call fit() before search().")
 
         t0 = time.perf_counter()
-        query_vec = self._vectorizer.transform([query])
+        q = self.preprocessor(query) if self.preprocessor else query
+        query_vec = self._vectorizer.transform([q])
         scores = cosine_similarity(query_vec, self._tfidf_matrix).flatten()
-        top_indices = scores.argsort()[-top_n:][::-1].tolist()
+        top_indices = scores.argsort()[-top_n:][::-1]
+        result = [(int(i), float(scores[i])) for i in top_indices]
         elapsed = time.perf_counter() - t0
         logger.debug("%s — query '%s' in %.4fs", self.name, query, elapsed)
-        return top_indices
+        return result
 
 
 class BM25SearchEngine(SearchEngine):
@@ -110,14 +126,18 @@ class BM25SearchEngine(SearchEngine):
         self,
         columns: list[str] | None = None,
         tokenizer: Callable[[str], list[str]] | None = None,
+        preprocessor: Callable[[str], str] | None = None,
+        name_override: str | None = None,
     ):
         self.columns = columns or ["product_name", "product_description"]
         self.tokenizer = tokenizer or self._default_tokenizer
+        self.preprocessor = preprocessor
+        self._name_override = name_override
         self._bm25: BM25Okapi | None = None
 
     @property
     def name(self) -> str:
-        return f"BM25 ({', '.join(self.columns)})"
+        return self._name_override or f"BM25 ({', '.join(self.columns)})"
 
     @staticmethod
     def _default_tokenizer(text: str) -> list[str]:
@@ -125,6 +145,8 @@ class BM25SearchEngine(SearchEngine):
 
     def fit(self, product_df: pd.DataFrame) -> None:
         combined = self._combine_columns(product_df, self.columns)
+        if self.preprocessor:
+            combined = combined.map(self.preprocessor)
         corpus = [self.tokenizer(doc) for doc in combined]
         self._bm25 = BM25Okapi(corpus)
         logger.info(
@@ -133,17 +155,21 @@ class BM25SearchEngine(SearchEngine):
             len(corpus),
         )
 
-    def search(self, query: str, top_n: int = 10) -> list[int]:
+    def search_with_scores(
+        self, query: str, top_n: int = 10
+    ) -> list[tuple[int, float]]:
         if self._bm25 is None:
             raise RuntimeError("Call fit() before search().")
 
         t0 = time.perf_counter()
-        tokenized_query = self.tokenizer(query)
+        q = self.preprocessor(query) if self.preprocessor else query
+        tokenized_query = self.tokenizer(q)
         scores = self._bm25.get_scores(tokenized_query)
-        top_indices = np.argsort(scores)[-top_n:][::-1].tolist()
+        top_indices = np.argsort(scores)[-top_n:][::-1]
+        result = [(int(i), float(scores[i])) for i in top_indices]
         elapsed = time.perf_counter() - t0
         logger.debug("%s — query '%s' in %.4fs", self.name, query, elapsed)
-        return top_indices
+        return result
 
 
 class SentenceTransformerSearchEngine(SearchEngine):
@@ -193,14 +219,91 @@ class SentenceTransformerSearchEngine(SearchEngine):
         elapsed = time.perf_counter() - t0
         logger.info("%s — encoding finished in %.1fs", self.name, elapsed)
 
-    def search(self, query: str, top_n: int = 10) -> list[int]:
+    def search_with_scores(
+        self, query: str, top_n: int = 10
+    ) -> list[tuple[int, float]]:
         if self._model is None or self._embeddings is None:
             raise RuntimeError("Call fit() before search().")
 
         t0 = time.perf_counter()
         query_emb = self._model.encode([query])
         scores = cosine_similarity(query_emb, self._embeddings).flatten()
-        top_indices = scores.argsort()[-top_n:][::-1].tolist()
+        top_indices = scores.argsort()[-top_n:][::-1]
+        result = [(int(i), float(scores[i])) for i in top_indices]
         elapsed = time.perf_counter() - t0
         logger.debug("%s — query '%s' in %.4fs", self.name, query, elapsed)
-        return top_indices
+        return result
+
+
+class WeightedTfidfSearchEngine(SearchEngine):
+    """TF-IDF with per-field weighting.
+
+    Fits a separate ``TfidfVectorizer`` for each column and combines
+    the cosine-similarity scores using the supplied weights.
+
+    Parameters
+    ----------
+    column_weights : dict[str, float]
+        Mapping of column name -> weight (e.g. ``{"product_name": 3.0}``).
+    vectorizer_kwargs : dict | None
+        Shared kwargs forwarded to every ``TfidfVectorizer``.
+    preprocessor : callable | None
+        Text preprocessing function applied to each field.
+    name_override : str | None
+        Custom display name for this engine.
+    """
+
+    def __init__(
+        self,
+        column_weights: dict[str, float],
+        vectorizer_kwargs: dict[str, Any] | None = None,
+        preprocessor: Callable[[str], str] | None = None,
+        name_override: str | None = None,
+    ):
+        self.column_weights = column_weights
+        self.vectorizer_kwargs = vectorizer_kwargs or {}
+        self.preprocessor = preprocessor
+        self._name_override = name_override
+        self._vectorizers: dict[str, TfidfVectorizer] = {}
+        self._matrices: dict[str, Any] = {}
+
+    @property
+    def name(self) -> str:
+        if self._name_override:
+            return self._name_override
+        parts = [f"{c}×{w}" for c, w in self.column_weights.items()]
+        return f"Weighted TF-IDF ({', '.join(parts)})"
+
+    def fit(self, product_df: pd.DataFrame) -> None:
+        for col in self.column_weights:
+            text = product_df[col].fillna("").astype(str)
+            if self.preprocessor:
+                text = text.map(self.preprocessor)
+            vec = TfidfVectorizer(**self.vectorizer_kwargs)
+            self._matrices[col] = vec.fit_transform(text)
+            self._vectorizers[col] = vec
+        total_docs = next(iter(self._matrices.values())).shape[0]
+        logger.info("%s — indexed %d documents across %d fields",
+                    self.name, total_docs, len(self.column_weights))
+
+    def search_with_scores(
+        self, query: str, top_n: int = 10
+    ) -> list[tuple[int, float]]:
+        if not self._vectorizers:
+            raise RuntimeError("Call fit() before search().")
+
+        t0 = time.perf_counter()
+        q = self.preprocessor(query) if self.preprocessor else query
+        n_docs = next(iter(self._matrices.values())).shape[0]
+        combined_scores = np.zeros(n_docs)
+
+        for col, weight in self.column_weights.items():
+            qvec = self._vectorizers[col].transform([q])
+            scores = cosine_similarity(qvec, self._matrices[col]).flatten()
+            combined_scores += weight * scores
+
+        top_indices = combined_scores.argsort()[-top_n:][::-1]
+        result = [(int(i), float(combined_scores[i])) for i in top_indices]
+        elapsed = time.perf_counter() - t0
+        logger.debug("%s — query '%s' in %.4fs", self.name, query, elapsed)
+        return result
