@@ -214,7 +214,7 @@ class SentenceTransformerSearchEngine(SearchEngine):
         )
         t0 = time.perf_counter()
         self._embeddings = self._model.encode(
-            combined, batch_size=self.batch_size, show_progress_bar=True
+            combined, batch_size=self.batch_size, show_progress_bar=False
         )
         elapsed = time.perf_counter() - t0
         logger.info("%s — encoding finished in %.1fs", self.name, elapsed)
@@ -537,7 +537,7 @@ class CrossEncoderReranker:
             )
             pairs.append((query, doc))
             idxs.append(idx)
-        scores = self._model.predict(pairs)
+        scores = self._model.predict(pairs, show_progress_bar=False)
         scored = list(zip(idxs, scores.tolist()))
         scored.sort(key=lambda x: x[1], reverse=True)
         return scored
