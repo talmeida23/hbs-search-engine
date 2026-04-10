@@ -518,6 +518,10 @@ class CrossEncoderReranker:
             self._model = CrossEncoder(self.model_name)
             logger.info("CrossEncoderReranker — loaded %s", self.model_name)
 
+    def release_model(self):
+        """Free the cross-encoder model from memory (lazy-reloads on next call)."""
+        self._model = None
+
     def __call__(
         self,
         query: str,
@@ -537,6 +541,54 @@ class CrossEncoderReranker:
         scored = list(zip(idxs, scores.tolist()))
         scored.sort(key=lambda x: x[1], reverse=True)
         return scored
+
+
+# ====================================================================== #
+# Phase D: Query-expanded engine wrapper                                 #
+# ====================================================================== #
+
+
+class QueryExpandedSearchEngine(SearchEngine):
+    """Wraps any SearchEngine, applying query expansion before retrieval.
+
+    The *expander* is a callable with signature ``expand(query) -> str``
+    (any :class:`query_processor.QueryExpander` instance works).
+
+    Parameters
+    ----------
+    engine : SearchEngine
+        A **fitted** inner search engine.
+    expander : callable
+        ``expander.expand(query) -> expanded_query``.
+    name_override : str | None
+        Custom display name.
+    """
+
+    def __init__(
+        self,
+        engine: "SearchEngine",
+        expander: Any,
+        name_override: str | None = None,
+    ):
+        self.engine = engine
+        self.expander = expander
+        self._name_override = name_override
+
+    @property
+    def name(self) -> str:
+        if self._name_override:
+            return self._name_override
+        return f"Expanded({self.engine.name})"
+
+    def fit(self, product_df: pd.DataFrame) -> None:
+        # Inner engine is assumed already fitted.
+        logger.info("%s — ready (inner engine already fitted)", self.name)
+
+    def search_with_scores(
+        self, query: str, top_n: int = 10
+    ) -> list[tuple[int, float]]:
+        expanded = self.expander.expand(query)
+        return self.engine.search_with_scores(expanded, top_n)
 
 
 class MetadataBoostReranker:
