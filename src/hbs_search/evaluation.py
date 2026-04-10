@@ -4,7 +4,7 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 
-from search_engine import SearchEngine
+from hbs_search.search_engine import SearchEngine
 
 logger = logging.getLogger(__name__)
 

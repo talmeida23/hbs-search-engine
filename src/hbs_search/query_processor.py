@@ -17,10 +17,11 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-_CACHE_DIR = Path(__file__).parent / ".cache"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_CACHE_DIR = PROJECT_ROOT / ".cache"
 
 # Load .env file if present (no extra dependency needed)
-_env_path = Path(__file__).parent / ".env"
+_env_path = PROJECT_ROOT / ".env"
 if _env_path.exists():
     for line in _env_path.read_text(encoding="utf-8").splitlines():
         line = line.strip()

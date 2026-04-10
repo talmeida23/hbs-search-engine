@@ -16,8 +16,10 @@ class WANDSDataLoader:
 
     REPO_URL = "https://github.com/wayfair/WANDS.git"
 
-    def __init__(self, base_path: str = ".", repo_dir: str = "WANDS"):
-        self.base_path = Path(base_path)
+    def __init__(self, base_path: str | None = None, repo_dir: str = "WANDS"):
+        # Default to project root when used from the packaged src layout.
+        default_base = Path(__file__).resolve().parents[2]
+        self.base_path = Path(base_path) if base_path is not None else default_base
         self.repo_path = self.base_path / repo_dir
         self.dataset_path = self.repo_path / "dataset"
 
