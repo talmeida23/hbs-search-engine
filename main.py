@@ -1,5 +1,5 @@
 def main():
-    print("Hello from hbs-search-engine!")
+    print("Hello from ecommerce-search-engine!")
 
 
 if __name__ == "__main__":

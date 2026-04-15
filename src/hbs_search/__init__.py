@@ -1,2 +1,0 @@
-"""hbs_search package."""
-

@@ -6,9 +6,9 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from hbs_search.data_loader import WANDSDataLoader
-from hbs_search.evaluation import Evaluator
-from hbs_search.search_engine import TfidfSearchEngine
+from ecom_search.data_loader import WANDSDataLoader
+from ecom_search.evaluation import Evaluator
+from ecom_search.search_engine import TfidfSearchEngine
 
 
 def main() -> None:
